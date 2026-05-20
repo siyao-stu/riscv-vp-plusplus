@@ -56,12 +56,14 @@
 #include "platform/common/channel_console.h"
 #include "platform/common/channel_slip.h"
 #include "platform/common/ds1307.h"
+#include "platform/common/dummy_tlm_target.h"
 #include "platform/common/fu540_gpio.h"
 #include "platform/common/fu540_i2c.h"
 #include "platform/common/fu540_uart.h"
 #include "platform/common/memory.h"
 #include "platform/common/memory_mapped_file.h"
 #include "platform/common/miscdev.h"
+#include "platform/common/ns16550a_uart.h"
 #include "platform/common/options.h"
 #include "platform/common/sifive_plic.h"
 #include "platform/common/sifive_spi.h"
@@ -80,6 +82,8 @@
 #if !defined(NUM_CORES)
 #define NUM_CORES (4 + 1)
 #endif
+
+#define UEFI_FLASH_SIZE_MB 32
 
 #if defined(TARGET_RV32)
 using namespace rv32;
@@ -119,11 +123,15 @@ struct LinuxOptions : public Options {
 	addr_t mem_end_addr = mem_start_addr + mem_size - 1;
 	addr_t clint_start_addr = 0x02000000;
 	addr_t clint_end_addr = 0x0200ffff;
+	addr_t platform_bus_start_addr = 0x04000000;
+	addr_t platform_bus_end_addr = 0x05ffffff;
 	addr_t sys_start_addr = 0x02010000;
 	addr_t sys_end_addr = 0x020103ff;
 	addr_t dtb_rom_start_addr = 0x00001000;
 	addr_t dtb_rom_size = 0x2000;
 	addr_t dtb_rom_end_addr = dtb_rom_start_addr + dtb_rom_size - 1;
+	addr_t uefi_uart_start_addr = 0x10000000;
+	addr_t uefi_uart_end_addr = uefi_uart_start_addr + 0x100 - 1;
 	addr_t uart0_start_addr = 0x10010000;
 	addr_t uart0_end_addr = 0x10010fff;
 	addr_t uart1_start_addr = 0x10011000;
@@ -137,7 +145,7 @@ struct LinuxOptions : public Options {
 	addr_t spi2_start_addr = 0x10050000;
 	addr_t spi2_end_addr = 0x10050FFF;
 	addr_t plic_start_addr = 0x0C000000;
-	addr_t plic_end_addr = 0x10000000;
+	addr_t plic_end_addr = 0x0FFFFFFF;
 	addr_t prci_start_addr = 0x10000000;
 	addr_t prci_end_addr = 0x10000FFF;
 	addr_t miscdev_start_addr = 0x10001000;
@@ -150,6 +158,12 @@ struct LinuxOptions : public Options {
 	addr_t vncsimpleinputptr_end_addr = 0x12000fff;
 	addr_t vncsimpleinputkbd_start_addr = 0x12001000;
 	addr_t vncsimpleinputkbd_end_addr = 0x12001fff;
+	addr_t uefi_flash_code_start_addr = 0x20000000;
+	addr_t uefi_flash_code_size = 1024u * 1024u * (unsigned int)(UEFI_FLASH_SIZE_MB);
+	addr_t uefi_flash_code_end_addr = uefi_flash_code_start_addr + uefi_flash_code_size - 1;
+	addr_t uefi_flash_vars_start_addr = 0x22000000;
+	addr_t uefi_flash_vars_size = 1024u * 1024u * (unsigned int)(UEFI_FLASH_SIZE_MB);
+	addr_t uefi_flash_vars_end_addr = uefi_flash_vars_start_addr + uefi_flash_vars_size - 1;
 	addr_t mram_root_start_addr = 0x40000000;
 	addr_t mram_root_size = 1024u * 1024u * (unsigned int)(MRAM_SIZE_MB);
 	addr_t mram_root_end_addr = mram_root_start_addr + mram_root_size - 1;
@@ -163,9 +177,12 @@ struct LinuxOptions : public Options {
 	std::string dtb_file;
 	std::string kernel_file;
 	std::string tun_device = "tun0";
+	std::string uefi_code_image;
+	std::string uefi_vars_image;
 	std::string mram_root_image;
 	std::string mram_data_image;
 	std::string sd_card_image;
+	bool dummy_tlm_target_debug = false;
 
 	unsigned int vnc_port = 5900;
 
@@ -180,11 +197,16 @@ struct LinuxOptions : public Options {
 			("dtb-file", po::value<std::string>(&dtb_file)->required(), "dtb file for boot loading")
 			("kernel-file", po::value<std::string>(&kernel_file), "optional kernel file to load (supports ELF or RAW files)")
 			("tun-device", po::value<std::string>(&tun_device), "tun device used by SLIP")
+			("uefi-code-image", po::value<std::string>(&uefi_code_image)->default_value(""), "UEFI code flash image mapped at 0x20000000")
+			("uefi-code-image-size", po::value<uint64_t>(&uefi_flash_code_size), "UEFI code flash image size")
+			("uefi-vars-image", po::value<std::string>(&uefi_vars_image)->default_value(""), "UEFI variable flash image mapped at 0x22000000")
+			("uefi-vars-image-size", po::value<uint64_t>(&uefi_flash_vars_size), "UEFI variable flash image size")
 			("mram-root-image", po::value<std::string>(&mram_root_image)->default_value(""),"MRAM root image file")
 			("mram-root-image-size", po::value<uint64_t>(&mram_root_size), "MRAM root image size")
 			("mram-data-image", po::value<std::string>(&mram_data_image)->default_value(""),"MRAM data image file for persistency")
 			("mram-data-image-size", po::value<uint64_t>(&mram_data_size), "MRAM data image size")
 			("sd-card-image", po::value<std::string>(&sd_card_image)->default_value(""), "SD-Card image file (size must be multiple of 512 bytes)")
+			("dummy-tlm-target-debug", po::bool_switch(&dummy_tlm_target_debug), "print debug messages on dummy tlm target accesses")
 			("vnc-port", po::value<unsigned int>(&vnc_port), "select port number to connect with VNC")
 #ifdef TARGET_RV64_CHERIV9
 			("cheri-purecap", po::bool_switch(&cheri_purecap), "start in cheri purecap mode")
@@ -197,6 +219,12 @@ struct LinuxOptions : public Options {
 		Options::parse(argc, argv);
 		entry_point.finalize(parse_uint64_option);
 		mem_end_addr = mem_start_addr + mem_size - 1;
+		uefi_flash_code_end_addr = uefi_flash_code_start_addr + uefi_flash_code_size - 1;
+		uefi_flash_vars_end_addr = uefi_flash_vars_start_addr + uefi_flash_vars_size - 1;
+		assert(uefi_flash_code_end_addr < uefi_flash_vars_start_addr &&
+		       "UEFI code flash too big, would overlap UEFI vars flash");
+		assert(uefi_flash_vars_end_addr < mram_root_start_addr &&
+		       "UEFI vars flash too big, would overlap MRAM root");
 		mram_root_end_addr = mram_root_start_addr + mram_root_size - 1;
 		assert(mram_root_end_addr < mram_data_start_addr && "MRAM root too big, would overlap MRAM root");
 		mram_data_end_addr = mram_data_start_addr + mram_data_size - 1;
@@ -306,18 +334,22 @@ int sc_main(int argc, char **argv) {
 	SimpleMemory mem("SimpleMemory", opt.mem_size);
 #endif
 	SimpleMemory dtb_rom("DTB_ROM", opt.dtb_rom_size);
+	MemoryMappedFile uefiCodeFlash("UEFI_Code_Flash", opt.uefi_code_image, opt.uefi_flash_code_size, true);
+	MemoryMappedFile uefiVarsFlash("UEFI_Vars_Flash", opt.uefi_vars_image, opt.uefi_flash_vars_size, true);
 	ELFLoader loader(opt.input_program.c_str());
 	NetTrace *debug_bus = nullptr;
 	if (opt.use_debug_bus) {
 		debug_bus = new NetTrace(opt.debug_bus_port);
 	}
-	SimpleBus<NUM_CORES + 1, 20> bus("SimpleBus", debug_bus, opt.break_on_transaction);
+	SimpleBus<NUM_CORES + 1, 24> bus("SimpleBus", debug_bus, opt.break_on_transaction);
 	SyscallHandler sys("SyscallHandler");
 	SIFIVE_PLIC plic("PLIC", true, NUM_CORES, 53);
 	LWRT_CLINT<NUM_CORES> clint("CLINT");
 	PRCI prci("PRCI");
 	MiscDev miscdev("MiscDev");
+	DUMMY_TLM_TARGET platform_bus("platform_bus", opt.platform_bus_start_addr, opt.dummy_tlm_target_debug);
 	Channel_Console channel_console;
+	NS16550A_UART uart_uefi("uart_uefi", &channel_console, 10);
 	FU540_UART uart0("UART0", &channel_console, 4);
 	Channel_SLIP channel_slip(opt.tun_device);
 	FU540_UART slip("UART1", &channel_slip, 5);
@@ -384,24 +416,28 @@ int sc_main(int argc, char **argv) {
 	bus.ports[1] = new PortMapping(opt.clint_start_addr, opt.clint_end_addr, clint);
 	bus.ports[2] = new PortMapping(opt.sys_start_addr, opt.sys_end_addr, sys);
 	bus.ports[3] = new PortMapping(opt.dtb_rom_start_addr, opt.dtb_rom_end_addr, dtb_rom);
-	bus.ports[4] = new PortMapping(opt.uart0_start_addr, opt.uart0_end_addr, uart0);
-	bus.ports[5] = new PortMapping(opt.uart1_start_addr, opt.uart1_end_addr, slip);
-	bus.ports[6] = new PortMapping(opt.gpio_start_addr, opt.gpio_end_addr, gpio);
-	bus.ports[7] = new PortMapping(opt.spi0_start_addr, opt.spi0_end_addr, spi0);
-	bus.ports[8] = new PortMapping(opt.spi1_start_addr, opt.spi1_end_addr, spi1);
-	bus.ports[9] = new PortMapping(opt.spi2_start_addr, opt.spi2_end_addr, spi2);
-	bus.ports[10] = new PortMapping(opt.plic_start_addr, opt.plic_end_addr, plic);
-	bus.ports[11] = new PortMapping(opt.prci_start_addr, opt.prci_end_addr, prci);
-	bus.ports[12] = new PortMapping(opt.miscdev_start_addr, opt.miscdev_end_addr, miscdev);
-	bus.ports[13] = new PortMapping(opt.sifive_test_start_addr, opt.sifive_test_end_addr, sifive_test);
-	bus.ports[14] = new PortMapping(opt.vncsimplefb_start_addr, opt.vncsimplefb_end_addr, vncsimplefb);
-	bus.ports[15] =
+	bus.ports[4] = new PortMapping(opt.uefi_uart_start_addr, opt.uefi_uart_end_addr, uart_uefi);
+	bus.ports[5] = new PortMapping(opt.uart0_start_addr, opt.uart0_end_addr, uart0);
+	bus.ports[6] = new PortMapping(opt.uart1_start_addr, opt.uart1_end_addr, slip);
+	bus.ports[7] = new PortMapping(opt.gpio_start_addr, opt.gpio_end_addr, gpio);
+	bus.ports[8] = new PortMapping(opt.spi0_start_addr, opt.spi0_end_addr, spi0);
+	bus.ports[9] = new PortMapping(opt.spi1_start_addr, opt.spi1_end_addr, spi1);
+	bus.ports[10] = new PortMapping(opt.spi2_start_addr, opt.spi2_end_addr, spi2);
+	bus.ports[11] = new PortMapping(opt.plic_start_addr, opt.plic_end_addr, plic);
+	bus.ports[12] = new PortMapping(opt.prci_start_addr, opt.prci_end_addr, prci);
+	bus.ports[13] = new PortMapping(opt.miscdev_start_addr, opt.miscdev_end_addr, miscdev);
+	bus.ports[14] = new PortMapping(opt.platform_bus_start_addr, opt.platform_bus_end_addr, platform_bus);
+	bus.ports[15] = new PortMapping(opt.sifive_test_start_addr, opt.sifive_test_end_addr, sifive_test);
+	bus.ports[16] = new PortMapping(opt.uefi_flash_code_start_addr, opt.uefi_flash_code_end_addr, uefiCodeFlash);
+	bus.ports[17] = new PortMapping(opt.uefi_flash_vars_start_addr, opt.uefi_flash_vars_end_addr, uefiVarsFlash);
+	bus.ports[18] = new PortMapping(opt.vncsimplefb_start_addr, opt.vncsimplefb_end_addr, vncsimplefb);
+	bus.ports[19] =
 	    new PortMapping(opt.vncsimpleinputptr_start_addr, opt.vncsimpleinputptr_end_addr, vncsimpleinputptr);
-	bus.ports[16] =
+	bus.ports[20] =
 	    new PortMapping(opt.vncsimpleinputkbd_start_addr, opt.vncsimpleinputkbd_end_addr, vncsimpleinputkbd);
-	bus.ports[17] = new PortMapping(opt.mram_root_start_addr, opt.mram_root_end_addr, mramRoot);
-	bus.ports[18] = new PortMapping(opt.mram_data_start_addr, opt.mram_data_end_addr, mramData);
-	bus.ports[19] = new PortMapping(opt.i2c_start_addr, opt.i2c_end_addr, i2c);
+	bus.ports[21] = new PortMapping(opt.mram_root_start_addr, opt.mram_root_end_addr, mramRoot);
+	bus.ports[22] = new PortMapping(opt.mram_data_start_addr, opt.mram_data_end_addr, mramData);
+	bus.ports[23] = new PortMapping(opt.i2c_start_addr, opt.i2c_end_addr, i2c);
 	bus.mapping_complete();
 
 	// connect TLM sockets
@@ -413,22 +449,26 @@ int sc_main(int argc, char **argv) {
 	bus.isocks[1].bind(clint.tsock);
 	bus.isocks[2].bind(sys.tsock);
 	bus.isocks[3].bind(dtb_rom.tsock);
-	bus.isocks[4].bind(uart0.tsock);
-	bus.isocks[5].bind(slip.tsock);
-	bus.isocks[6].bind(gpio.tsock);
-	bus.isocks[7].bind(spi0.tsock);
-	bus.isocks[8].bind(spi1.tsock);
-	bus.isocks[9].bind(spi2.tsock);
-	bus.isocks[10].bind(plic.tsock);
-	bus.isocks[11].bind(prci.tsock);
-	bus.isocks[12].bind(miscdev.tsock);
-	bus.isocks[13].bind(sifive_test.tsock);
-	bus.isocks[14].bind(vncsimplefb.tsock);
-	bus.isocks[15].bind(vncsimpleinputptr.tsock);
-	bus.isocks[16].bind(vncsimpleinputkbd.tsock);
-	bus.isocks[17].bind(mramRoot.tsock);
-	bus.isocks[18].bind(mramData.tsock);
-	bus.isocks[19].bind(i2c.tsock);
+	bus.isocks[4].bind(uart_uefi.tsock);
+	bus.isocks[5].bind(uart0.tsock);
+	bus.isocks[6].bind(slip.tsock);
+	bus.isocks[7].bind(gpio.tsock);
+	bus.isocks[8].bind(spi0.tsock);
+	bus.isocks[9].bind(spi1.tsock);
+	bus.isocks[10].bind(spi2.tsock);
+	bus.isocks[11].bind(plic.tsock);
+	bus.isocks[12].bind(prci.tsock);
+	bus.isocks[13].bind(miscdev.tsock);
+	bus.isocks[14].bind(platform_bus.tsock);
+	bus.isocks[15].bind(sifive_test.tsock);
+	bus.isocks[16].bind(uefiCodeFlash.tsock);
+	bus.isocks[17].bind(uefiVarsFlash.tsock);
+	bus.isocks[18].bind(vncsimplefb.tsock);
+	bus.isocks[19].bind(vncsimpleinputptr.tsock);
+	bus.isocks[20].bind(vncsimpleinputkbd.tsock);
+	bus.isocks[21].bind(mramRoot.tsock);
+	bus.isocks[22].bind(mramData.tsock);
+	bus.isocks[23].bind(i2c.tsock);
 
 	// connect interrupt signals/communication
 	for (size_t i = 0; i < NUM_CORES; i++) {
@@ -436,6 +476,7 @@ int sc_main(int argc, char **argv) {
 		clint.target_harts[i] = &cores[i]->iss;
 	}
 	uart0.plic = &plic;
+	uart_uefi.plic = &plic;
 	slip.plic = &plic;
 	gpio.plic = &plic;
 	spi0.plic = &plic;

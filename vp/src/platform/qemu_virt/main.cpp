@@ -51,13 +51,19 @@
 #endif
 
 #include "platform/common/channel_console.h"
+#include "platform/common/bus.h"
 #include "platform/common/dummy_tlm_target.h"
+#include "platform/common/fu540_gpio.h"
 #include "platform/common/memory.h"
+#include "platform/common/memory_mapped_file.h"
 #include "platform/common/ns16550a_uart.h"
 #include "platform/common/options.h"
 #include "platform/common/sifive_plic.h"
+#include "platform/common/sifive_spi.h"
 #include "platform/common/sifive_test.h"
+#include "platform/common/spi_sd_card.h"
 #include "platform/common/tagged_memory.h"
+#include "platform/common/virtio_mmio_blk.h"
 #include "util/options.h"
 #include "util/propertytree.h"
 
@@ -80,6 +86,21 @@ using namespace cheriv9::rv64;
 
 #endif /* TARGET_RVxx */
 
+#define UEFI_FLASH_SIZE_MB 32
+#define FW_DYNAMIC_INFO_MAGIC_VALUE 0x4942534fUL
+#define FW_DYNAMIC_INFO_VERSION_2 0x2UL
+#define FW_DYNAMIC_INFO_NEXT_MODE_S 0x1UL
+#define FW_DYNAMIC_INFO_NEXT_MODE_M 0x3UL
+
+struct FW_Dynamic_Info {
+	unsigned long magic;
+	unsigned long version;
+	unsigned long next_addr;
+	unsigned long next_mode;
+	unsigned long options;
+	unsigned long boot_hart;
+};
+
 namespace po = boost::program_options;
 
 struct LinuxOptions : public Options {
@@ -93,9 +114,11 @@ struct LinuxOptions : public Options {
 	addr_t fwcfg_start_addr = 0x10100000;
 	addr_t fwcfg_end_addr = fwcfg_start_addr + 0x18 - 1;
 	addr_t flash0_start_addr = 0x20000000;
-	addr_t flash0_end_addr = flash0_start_addr + 0x2000000 - 1;
+	addr_t flash0_size = 1024u * 1024u * (unsigned int)(UEFI_FLASH_SIZE_MB);
+	addr_t flash0_end_addr = flash0_start_addr + flash0_size - 1;
 	addr_t flash1_start_addr = 0x22000000;
-	addr_t flash1_end_addr = flash1_start_addr + 0x2000000 - 1;
+	addr_t flash1_size = 1024u * 1024u * (unsigned int)(UEFI_FLASH_SIZE_MB);
+	addr_t flash1_end_addr = flash1_start_addr + flash1_size - 1;
 	addr_t platform_bus_start_addr = 0x4000000;
 	addr_t platform_bus_end_addr = platform_bus_start_addr + 0x2000000 - 1;
 	addr_t mem_size = 1024ul * 1024ul * (uint64_t)(MEM_SIZE_MB);
@@ -112,13 +135,18 @@ struct LinuxOptions : public Options {
 	addr_t virtio_mmio_start_addr = 0x10001000;
 	addr_t virtio_mmio_end_addr = virtio_mmio_start_addr + 0x8000 - 1;
 	addr_t plic_start_addr = 0xc000000;
-	addr_t plic_end_addr = virtio_mmio_start_addr + 0x600000 - 1;
+	addr_t plic_end_addr = plic_start_addr + 0x600000 - 1;
 	addr_t clint_start_addr = 0x02000000;
 	addr_t clint_end_addr = clint_start_addr + 0x10000 - 1;
 
 	OptionValue<unsigned long> entry_point;
 	std::string dtb_file;
 	std::string kernel_file;
+	std::string uefi_code_image;
+	std::string uefi_vars_image;
+	std::string sd_card_image;
+	std::string virtio_blk_image;
+	bool virtio_blk_debug = false;
 	bool dummy_tlm_target_debug = false;
 	bool cheri_purecap = false;
 
@@ -130,6 +158,13 @@ struct LinuxOptions : public Options {
 			("entry-point", po::value<std::string>(&entry_point.option),"set entry point address (ISS program counter)")
 			("dtb-file", po::value<std::string>(&dtb_file)->required(), "dtb file for boot loading")
 			("kernel-file", po::value<std::string>(&kernel_file), "optional kernel file to load (supports ELF or RAW files)")
+			("uefi-code-image", po::value<std::string>(&uefi_code_image)->default_value(""), "UEFI code flash image mapped at 0x20000000")
+			("uefi-code-image-size", po::value<uint64_t>(&flash0_size), "UEFI code flash image size")
+			("uefi-vars-image", po::value<std::string>(&uefi_vars_image)->default_value(""), "UEFI variable flash image mapped at 0x22000000")
+			("uefi-vars-image-size", po::value<uint64_t>(&flash1_size), "UEFI variable flash image size")
+			("sd-card-image", po::value<std::string>(&sd_card_image)->default_value(""), "SD-Card image file (size must be multiple of 512 bytes)")
+			("virtio-blk-image", po::value<std::string>(&virtio_blk_image)->default_value(""), "Virtio-MMIO block image file")
+			("virtio-blk-debug", po::bool_switch(&virtio_blk_debug), "enable virtio-mmio block debug logging")
 			("dummy-tlm-target-debug", po::bool_switch(&dummy_tlm_target_debug), "print debug messages on dummy-tlm-target peripheral accesses")
 #ifdef TARGET_RV64_CHERIV9
 			("cheri-purecap", po::bool_switch(&cheri_purecap), "start in cheri purecap mode")
@@ -142,6 +177,10 @@ struct LinuxOptions : public Options {
 		Options::parse(argc, argv);
 		entry_point.finalize(parse_uint64_option);
 		mem_end_addr = mem_start_addr + mem_size - 1;
+		flash0_end_addr = flash0_start_addr + flash0_size - 1;
+		flash1_end_addr = flash1_start_addr + flash1_size - 1;
+		assert(flash0_end_addr < flash1_start_addr && "flash0 too big, would overlap flash1");
+		assert(flash1_end_addr < pci_start_addr && "flash1 too big, would overlap PCI window");
 	}
 };
 
@@ -208,6 +247,40 @@ void handle_kernel_file(const LinuxOptions opt, load_if &mem) {
 	}
 }
 
+bool is_fw_dynamic_image(const std::string &input_program) {
+	return input_program.find("fw_dynamic") != std::string::npos;
+}
+
+void handle_fw_dynamic_info(const LinuxOptions &opt, load_if &mem, Core *cores[NUM_CORES]) {
+	if (!is_fw_dynamic_image(opt.input_program)) {
+		return;
+	}
+
+	// For fw_dynamic mode, follow the same boot model as fw_jump: jump to flash in S-mode.
+	// UEFI code/vars are mapped via CFI flash, so OpenSBI should jump to flash0.
+	unsigned long next_stage_addr = opt.flash0_start_addr;
+	unsigned long next_stage_mode = FW_DYNAMIC_INFO_NEXT_MODE_S;
+
+	unsigned long dyn_info_addr = (opt.mem_end_addr - sizeof(FW_Dynamic_Info)) & ~((unsigned long)sizeof(unsigned long) - 1UL);
+	FW_Dynamic_Info dyn_info = {
+	    .magic = FW_DYNAMIC_INFO_MAGIC_VALUE,
+	    .version = FW_DYNAMIC_INFO_VERSION_2,
+	    .next_addr = next_stage_addr,
+	    .next_mode = next_stage_mode,
+	    .options = 0,
+	    .boot_hart = (unsigned long)NUM_CORES - 1UL,
+	};
+
+	std::cout << "Info: fw_dynamic_info - next_addr=0x" << std::hex << dyn_info.next_addr
+	          << ", next_mode=" << std::dec << dyn_info.next_mode
+	          << ", boot_hart=" << dyn_info.boot_hart << std::endl;
+
+	mem.load_data(reinterpret_cast<const char *>(&dyn_info), dyn_info_addr - opt.mem_start_addr, sizeof(dyn_info));
+	for (size_t i = 0; i < NUM_CORES; i++) {
+		cores[i]->iss.regs[RegFile::a2] = dyn_info_addr;
+	}
+}
+
 int sc_main(int argc, char **argv) {
 	// PropertyTree::global()->set_debug(true);
 
@@ -244,12 +317,12 @@ int sc_main(int argc, char **argv) {
 	if (opt.use_debug_bus) {
 		debug_bus = new NetTrace(opt.debug_bus_port);
 	}
-	SimpleBus<NUM_CORES + 1, 13> bus("SimpleBus", debug_bus, opt.break_on_transaction);
+	SimpleBus<NUM_CORES + 2, 15> bus("SimpleBus", debug_bus, opt.break_on_transaction);
 
 	SimpleMemory dtb_rom("DTB_ROM", opt.dtb_rom_size);
 	DUMMY_TLM_TARGET fwcfg("fwcfg", opt.fwcfg_start_addr, opt.dummy_tlm_target_debug);
-	DUMMY_TLM_TARGET flash0("flash0", opt.flash0_start_addr, opt.dummy_tlm_target_debug);
-	DUMMY_TLM_TARGET flash1("flash1", opt.flash1_start_addr, opt.dummy_tlm_target_debug);
+	MemoryMappedFile flash0("flash0", opt.uefi_code_image, opt.flash0_size, true);
+	MemoryMappedFile flash1("flash1", opt.uefi_vars_image, opt.flash1_size, true);
 	DUMMY_TLM_TARGET platform_bus("platform_bus", opt.platform_bus_start_addr, opt.dummy_tlm_target_debug);
 #ifdef TARGET_RV64_CHERIV9
 	TaggedMemory mem("SimpleTaggedMemory", opt.mem_size);
@@ -262,7 +335,18 @@ int sc_main(int argc, char **argv) {
 	NS16550A_UART uart0_ns16550a("uart0", &channel_console, 10);
 	SIFIVE_Test sifive_test("SIFIVE_Test");
 	DUMMY_TLM_TARGET pci("pci", opt.pci_start_addr, opt.dummy_tlm_target_debug);
-	DUMMY_TLM_TARGET virtio_mmio("virtio_mmio", opt.virtio_mmio_start_addr, opt.dummy_tlm_target_debug);
+	VirtioMmioBlk virtio_mmio("virtio_mmio", 1);
+	const int gpioInterrupts[] = {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+	FU540_GPIO gpio("GPIO", gpioInterrupts);
+	SIFIVE_SPI<8> spi2("SPI2", 1, 6);
+	SPI_SD_Card spi_sd_card(&spi2, 0, &gpio, 11, false);
+	if (opt.sd_card_image.length()) {
+		spi_sd_card.insert(opt.sd_card_image);
+	}
+	if (opt.virtio_blk_image.length()) {
+		virtio_mmio.insert_image(opt.virtio_blk_image);
+	}
+	virtio_mmio.set_debug(opt.virtio_blk_debug);
 	SIFIVE_PLIC plic("PLIC", false, NUM_CORES, 96);
 	LWRT_CLINT<NUM_CORES> clint("CLINT");
 
@@ -309,15 +393,22 @@ int sc_main(int argc, char **argv) {
 	bus.ports[i++] = new PortMapping(opt.sifive_test_start_addr, opt.sifive_test_end_addr, sifive_test);
 	bus.ports[i++] = new PortMapping(opt.pci_start_addr, opt.pci_end_addr, pci);
 	bus.ports[i++] = new PortMapping(opt.virtio_mmio_start_addr, opt.virtio_mmio_end_addr, virtio_mmio);
+	bus.ports[i++] = new PortMapping(0x10060000, 0x10060fff, gpio);
+	bus.ports[i++] = new PortMapping(0x10050000, 0x10050fff, spi2);
 	bus.ports[i++] = new PortMapping(opt.plic_start_addr, opt.plic_end_addr, plic);
 	bus.ports[i++] = new PortMapping(opt.clint_start_addr, opt.clint_end_addr, clint);
 	bus.mapping_complete();
+	virtio_mmio.plic = &plic;
 
 	// connect TLM sockets
 	for (size_t i = 0; i < NUM_CORES; i++) {
 		cores[i]->memif.isock.bind(bus.tsocks[i]);
 	}
 	dbg_if.isock.bind(bus.tsocks[NUM_CORES]);
+	PeripheralWriteConnector virtio_connector("VirtioMmio-Connector");
+	virtio_connector.isock.bind(bus.tsocks[NUM_CORES + 1]);
+	virtio_mmio.isock.bind(virtio_connector.tsock);
+	virtio_connector.bus_lock = bus_lock;
 	i = 0;
 	bus.isocks[i++].bind(dtb_rom.tsock);
 	bus.isocks[i++].bind(fwcfg.tsock);
@@ -330,6 +421,8 @@ int sc_main(int argc, char **argv) {
 	bus.isocks[i++].bind(sifive_test.tsock);
 	bus.isocks[i++].bind(pci.tsock);
 	bus.isocks[i++].bind(virtio_mmio.tsock);
+	bus.isocks[i++].bind(gpio.tsock);
+	bus.isocks[i++].bind(spi2.tsock);
 	bus.isocks[i++].bind(plic.tsock);
 	bus.isocks[i++].bind(clint.tsock);
 
@@ -339,6 +432,8 @@ int sc_main(int argc, char **argv) {
 		clint.target_harts[i] = &cores[i]->iss;
 	}
 	uart0_ns16550a.plic = &plic;
+	gpio.plic = &plic;
+	spi2.plic = &plic;
 
 	for (size_t i = 0; i < NUM_CORES; i++) {
 		// switch for printing instructions
@@ -354,6 +449,7 @@ int sc_main(int argc, char **argv) {
 
 	// load kernel
 	handle_kernel_file(opt, mem);
+	handle_fw_dynamic_info(opt, mem, cores);
 
 	std::vector<mmu_memory_if *> mmus;
 	std::vector<debug_target_if *> dharts;

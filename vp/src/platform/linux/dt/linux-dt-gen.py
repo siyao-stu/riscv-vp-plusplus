@@ -261,13 +261,14 @@ dt_base = """
 	compatible = "sifive,fu540-c000", "sifive,fu540";
 
 	aliases {
-		serial0 = &uart0;
-		serial1 = &uart1;
+		serial0 = &uart_uefi;
+		serial1 = &uart0;
+		serial2 = &uart1;
 	};
 
 	chosen {
 		@BOOTARGS@
-		stdout-path = &uart0;
+		stdout-path = &uart_uefi;
 	};
 
 	cpus {
@@ -325,6 +326,20 @@ dt_base = """
 			compatible = "sifive,test1", "sifive,test0", "syscon";
 		};
 
+        flash0: flash@20000000 {
+            compatible = "cfi-flash";
+            reg = <0x0 0x20000000 0x0 0x2000000>;
+            bank-width = <4>;
+            label = "uefi-code";
+        };
+
+        flash1: flash@22000000 {
+            compatible = "cfi-flash";
+            reg = <0x0 0x22000000 0x0 0x2000000>;
+            bank-width = <4>;
+            label = "uefi-vars";
+        };
+
 		clint0: clint@2000000 {
 			compatible = "sifive,fu540-c000-clint", "sifive,clint0";
 			reg = <0x0 0x2000000 0x0 0xC000>;
@@ -346,6 +361,15 @@ dt_base = """
 			reg = <0x0 0x10001000 0x0 0x4>;
 			period = <1>;
 			quality = <100>;
+		};
+
+		uart_uefi: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			interrupt-parent = <&plic0>;
+			interrupts = <10>;
+			clock-frequency = <1843200>;
+			status = "okay";
 		};
 
 		uart0: serial@10010000 {

@@ -20,6 +20,7 @@ add_library(platform-common
 		net_trace.cpp
 		fu540_i2c.cpp
 		ds1307.cpp
+		virtio_mmio_blk.cpp
 		${HEADERS})
 
 # only for libvncserver > 0.9.13

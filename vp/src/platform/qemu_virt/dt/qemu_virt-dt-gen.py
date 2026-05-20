@@ -302,14 +302,12 @@ dt_base = """\
 	};
 */
 
-/*
-	// NOT SUPPORTED IN RISC-V VP++
 	flash@20000000 {
 		bank-width = <0x04>;
 		reg = <0x00 0x20000000 0x00 0x2000000 0x00 0x22000000 0x00 0x2000000>;
 		compatible = "cfi-flash";
+		status = "okay";
 	};
-*/
 
 	aliases {
 		serial0 = "/soc/serial@10000000";
@@ -340,7 +338,9 @@ dt_base = """\
 		serial@10000000 {
 			interrupts = <0x0a>;
 			interrupt-parent = <&plic>;
-			clock-frequency = "", "8@";
+			clock-frequency = <1843200>;
+			reg-shift = <0x00>;
+			reg-io-width = <0x01>;
 			reg = <0x00 0x10000000 0x00 0x100>;
 			compatible = "ns16550a";
 		};
@@ -350,55 +350,35 @@ dt_base = """\
 			compatible = "sifive,test1", "sifive,test0", "syscon";
 		};
 
-/*
-		// NOT SUPPORTED IN RISC-V VP++
-		virtio_mmio@10008000 {
-			interrupts = <0x08>;
+		gpio: gpio@10060000 {
+			compatible = "sifive,fu540-c000-gpio", "sifive,gpio0";
 			interrupt-parent = <&plic>;
-			reg = <0x00 0x10008000 0x00 0x1000>;
-			compatible = "virtio,mmio";
+			interrupts = <0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f 0x10 0x11 0x12 0x13 0x14 0x15 0x16>;
+			reg = <0x00 0x10060000 0x00 0x1000>;
+			gpio-controller;
+			#gpio-cells = <0x02>;
+			interrupt-controller;
+			#interrupt-cells = <0x02>;
+			status = "okay";
 		};
 
-		virtio_mmio@10007000 {
-			interrupts = <0x07>;
+		spi@10050000 {
+			compatible = "sifive,fu540-c000-spi", "sifive,spi0";
+			reg = <0x00 0x10050000 0x00 0x1000>;
 			interrupt-parent = <&plic>;
-			reg = <0x00 0x10007000 0x00 0x1000>;
-			compatible = "virtio,mmio";
-		};
-
-		virtio_mmio@10006000 {
 			interrupts = <0x06>;
-			interrupt-parent = <&plic>;
-			reg = <0x00 0x10006000 0x00 0x1000>;
-			compatible = "virtio,mmio";
-		};
+			#address-cells = <0x01>;
+			#size-cells = <0x00>;
+			status = "okay";
 
-		virtio_mmio@10005000 {
-			interrupts = <0x05>;
-			interrupt-parent = <&plic>;
-			reg = <0x00 0x10005000 0x00 0x1000>;
-			compatible = "virtio,mmio";
-		};
-
-		virtio_mmio@10004000 {
-			interrupts = <0x04>;
-			interrupt-parent = <&plic>;
-			reg = <0x00 0x10004000 0x00 0x1000>;
-			compatible = "virtio,mmio";
-		};
-
-		virtio_mmio@10003000 {
-			interrupts = <0x03>;
-			interrupt-parent = <&plic>;
-			reg = <0x00 0x10003000 0x00 0x1000>;
-			compatible = "virtio,mmio";
-		};
-
-		virtio_mmio@10002000 {
-			interrupts = <0x02>;
-			interrupt-parent = <&plic>;
-			reg = <0x00 0x10002000 0x00 0x1000>;
-			compatible = "virtio,mmio";
+			mmc@0 {
+				compatible = "mmc-spi-slot";
+				reg = <0x00>;
+				spi-max-frequency = <20000000>;
+				voltage-ranges = <3300 3300>;
+				disable-wp;
+				gpios = <&gpio 0x0b 0x01>;
+			};
 		};
 
 		virtio_mmio@10001000 {
@@ -407,7 +387,6 @@ dt_base = """\
 			reg = <0x00 0x10001000 0x00 0x1000>;
 			compatible = "virtio,mmio";
 		};
-*/
 
 		plic: plic@c000000 {
 			phandle = <0x03>;
