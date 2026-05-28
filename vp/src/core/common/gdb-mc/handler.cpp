@@ -229,10 +229,15 @@ void GDBServer::vCont(int conn, gdb_command_t *cmd) {
 	vcont = cmd->v.vval;
 	for (vcont = cmd->v.vval; vcont; vcont = vcont->next) {
 		bool single = false;
-		if (vcont->action == 's')
+		if (vcont->action == 's' || vcont->action == 'S')
 			single = true;
-		else if (vcont->action != 'c')
-			throw std::invalid_argument("Unimplemented vCont action"); /* TODO */
+		else if (vcont->action == 'c' || vcont->action == 'C')
+			single = false;
+		else {
+			/* Avoid throwing through the SystemC process context. */
+			send_packet(conn, "E02");
+			return;
+		}
 
 		std::vector<debug_target_if *> current_harts;
 		try {
@@ -303,7 +308,7 @@ void GDBServer::vContSupported(int conn, gdb_command_t *cmd) {
 
 	// We need to support both c and C otherwise GDB doesn't use vCont
 	// This is documented in the remote_vcont_probe function in the GDB source.
-	send_packet(conn, "vCont;c;C");
+	send_packet(conn, "vCont;c;C;s;S");
 }
 
 void GDBServer::removeBreakpoint(int conn, gdb_command_t *cmd) {

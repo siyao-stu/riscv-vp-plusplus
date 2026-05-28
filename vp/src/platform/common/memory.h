@@ -87,6 +87,8 @@ struct SimpleMemory : public sc_core::sc_module, public load_if {
 			sc_assert(false && "unsupported tlm command");
 		}
 
+		trans.set_response_status(tlm::TLM_OK_RESPONSE);
+
 		return len;
 	}
 

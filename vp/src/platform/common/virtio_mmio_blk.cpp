@@ -280,21 +280,39 @@ void VirtioMmioBlk::write_reg(uint64_t offset, uint32_t value) {
 			break;
 		case kVirtioMmioOffsetQueueDescLo:
 			queue_desc = (queue_desc & 0xffffffff00000000ULL) | value;
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_desc=0x" << std::hex << queue_desc << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueDescHi:
 			queue_desc = (queue_desc & 0x00000000ffffffffULL) | (static_cast<uint64_t>(value) << 32);
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_desc=0x" << std::hex << queue_desc << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueAvailLo:
 			queue_avail = (queue_avail & 0xffffffff00000000ULL) | value;
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_avail=0x" << std::hex << queue_avail << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueAvailHi:
 			queue_avail = (queue_avail & 0x00000000ffffffffULL) | (static_cast<uint64_t>(value) << 32);
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_avail=0x" << std::hex << queue_avail << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueUsedLo:
 			queue_used = (queue_used & 0xffffffff00000000ULL) | value;
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_used=0x" << std::hex << queue_used << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueUsedHi:
 			queue_used = (queue_used & 0x00000000ffffffffULL) | (static_cast<uint64_t>(value) << 32);
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] queue_used=0x" << std::hex << queue_used << std::dec << std::endl;
+			}
 			break;
 		case kVirtioMmioOffsetQueueNotify:
 			if (debug) {
@@ -354,13 +372,22 @@ bool VirtioMmioBlk::read_mem(uint64_t addr, uint8_t *data, size_t len) {
 	trans.set_address(addr);
 	trans.set_data_ptr(data);
 	trans.set_data_length(len);
+	trans.set_streaming_width(len);
+	trans.set_byte_enable_ptr(nullptr);
+	trans.set_byte_enable_length(0);
+	trans.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
 	isock->b_transport(trans, delay);
 	if (delay != sc_core::SC_ZERO_TIME) {
 		sc_core::wait(delay);
 	}
 
-	return trans.get_response_status() == tlm::TLM_OK_RESPONSE;
+	auto status = trans.get_response_status();
+	if (status != tlm::TLM_OK_RESPONSE && debug) {
+		std::cout << "[virtio-mmio-blk] read_mem failed addr=0x" << std::hex << addr
+		          << " len=" << std::dec << len << " status=" << status << std::endl;
+	}
+	return status == tlm::TLM_OK_RESPONSE;
 }
 
 bool VirtioMmioBlk::write_mem(uint64_t addr, const uint8_t *data, size_t len) {
@@ -369,13 +396,22 @@ bool VirtioMmioBlk::write_mem(uint64_t addr, const uint8_t *data, size_t len) {
 	trans.set_address(addr);
 	trans.set_data_ptr(const_cast<uint8_t *>(data));
 	trans.set_data_length(len);
+	trans.set_streaming_width(len);
+	trans.set_byte_enable_ptr(nullptr);
+	trans.set_byte_enable_length(0);
+	trans.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
 	isock->b_transport(trans, delay);
 	if (delay != sc_core::SC_ZERO_TIME) {
 		sc_core::wait(delay);
 	}
 
-	return trans.get_response_status() == tlm::TLM_OK_RESPONSE;
+	auto status = trans.get_response_status();
+	if (status != tlm::TLM_OK_RESPONSE && debug) {
+		std::cout << "[virtio-mmio-blk] write_mem failed addr=0x" << std::hex << addr
+		          << " len=" << std::dec << len << " status=" << status << std::endl;
+	}
+	return status == tlm::TLM_OK_RESPONSE;
 }
 
 void VirtioMmioBlk::handle_queue_notify(uint32_t queue_id) {
@@ -387,11 +423,24 @@ void VirtioMmioBlk::handle_queue_notify(uint32_t queue_id) {
 
 void VirtioMmioBlk::process_available() {
 	if (queue_ready == 0 || queue_num == 0 || queue_desc == 0 || queue_avail == 0 || queue_used == 0) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] process_available: not ready"
+			          << " ready=" << queue_ready
+			          << " num=" << queue_num
+			          << " desc=0x" << std::hex << queue_desc
+			          << " avail=0x" << queue_avail
+			          << " used=0x" << queue_used
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 
 	uint8_t avail_hdr[4] = {};
 	if (!read_mem(queue_avail, avail_hdr, sizeof(avail_hdr))) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] read avail hdr failed addr=0x" << std::hex << queue_avail
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 	uint16_t avail_flags = read_u16_le(avail_hdr);
@@ -405,6 +454,10 @@ void VirtioMmioBlk::process_available() {
 		uint8_t ring_entry[2] = {};
 		uint64_t ring_addr = queue_avail + 4 + static_cast<uint64_t>(ring_idx) * 2;
 		if (!read_mem(ring_addr, ring_entry, sizeof(ring_entry))) {
+			if (debug) {
+				std::cout << "[virtio-mmio-blk] read avail ring failed addr=0x" << std::hex << ring_addr
+				          << std::dec << std::endl;
+			}
 			return;
 		}
 		uint16_t head = read_u16_le(ring_entry);
@@ -426,6 +479,10 @@ void VirtioMmioBlk::process_descriptor_chain(uint16_t head_idx) {
 	uint8_t desc_buf[kVringDescSize] = {};
 	uint64_t desc_addr = queue_desc + static_cast<uint64_t>(head_idx) * kVringDescSize;
 	if (!read_mem(desc_addr, desc_buf, sizeof(desc_buf))) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] read desc failed addr=0x" << std::hex << desc_addr
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 
@@ -440,6 +497,10 @@ void VirtioMmioBlk::process_descriptor_chain(uint16_t head_idx) {
 		return;
 	}
 	if (!read_mem(desc0.addr, reinterpret_cast<uint8_t *>(&req), sizeof(req))) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] read req failed addr=0x" << std::hex << desc0.addr
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 	if (debug) {
@@ -455,6 +516,10 @@ void VirtioMmioBlk::process_descriptor_chain(uint16_t head_idx) {
 	uint8_t desc1_buf[kVringDescSize] = {};
 	uint64_t desc1_addr = queue_desc + static_cast<uint64_t>(desc0.next) * kVringDescSize;
 	if (!read_mem(desc1_addr, desc1_buf, sizeof(desc1_buf))) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] read desc1 failed addr=0x" << std::hex << desc1_addr
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 
@@ -480,6 +545,10 @@ void VirtioMmioBlk::process_descriptor_chain(uint16_t head_idx) {
 	uint8_t status_desc_buf[kVringDescSize] = {};
 	uint64_t status_desc_addr = queue_desc + static_cast<uint64_t>(status_desc_idx) * kVringDescSize;
 	if (!read_mem(status_desc_addr, status_desc_buf, sizeof(status_desc_buf))) {
+		if (debug) {
+			std::cout << "[virtio-mmio-blk] read status desc failed addr=0x" << std::hex << status_desc_addr
+			          << std::dec << std::endl;
+		}
 		return;
 	}
 	VringDesc status_desc{};

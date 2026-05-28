@@ -14,6 +14,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <exception>
+#ifdef __GNUG__
+#include <cxxabi.h>
+#endif
 #include <systemc>
 
 #include "platform/common/async_event.h"
@@ -299,6 +303,7 @@ void GDBServer::run(void) {
 			lock.unlock();
 
 			std::tie(conn, pkt) = ctx;
+			cmd = NULL;
 
 			switch (pkt->kind) {
 				case GDB_KIND_NACK:
@@ -310,25 +315,56 @@ void GDBServer::run(void) {
 					break;
 			}
 
-			if (!(cmd = gdb_parse_cmd(pkt))) {
-				send_packet(conn, NULL, GDB_KIND_NACK);
-				goto next1;
-			}
-
-			send_packet(conn, NULL, GDB_KIND_ACK);
 			try {
-				handler = handlers.at(cmd->name);
-			} catch (const std::out_of_range &) {
-				// For any command not supported by the stub, an
-				// empty response (‘$#00’) should be returned.
-				send_packet(conn, "");
-				goto next2;
-			}
+				if (!(cmd = gdb_parse_cmd(pkt))) {
+					send_packet(conn, NULL, GDB_KIND_NACK);
+					goto next1;
+				}
 
-			(this->*handler)(conn, cmd);
+				send_packet(conn, NULL, GDB_KIND_ACK);
+				try {
+					handler = handlers.at(cmd->name);
+				} catch (const std::out_of_range &) {
+					// For any command not supported by the stub, an
+					// empty response ('$#00') should be returned.
+					send_packet(conn, "");
+					goto next2;
+				}
+
+				(this->*handler)(conn, cmd);
+			} catch (const sc_core::sc_unwind_exception &) {
+				// Required by SystemC process control semantics.
+				throw;
+			} catch (const std::exception &e) {
+				warnx("gdb command handling failed (cmd=%s, pkt=%s): %s", cmd ? cmd->name : "<null>",
+				      (pkt && pkt->data) ? pkt->data : "<null>", e.what());
+				send_packet(conn, "E03");
+			} catch (const char *e) {
+				warnx("gdb command handling failed (cmd=%s, pkt=%s): %s", cmd ? cmd->name : "<null>",
+				      (pkt && pkt->data) ? pkt->data : "<null>", e ? e : "<null>");
+				send_packet(conn, "E03");
+			} catch (...) {
+				const char *type_name = "non-std/non-string exception";
+#ifdef __GNUG__
+				char *demangled = nullptr;
+				if (const std::type_info *ti = abi::__cxa_current_exception_type()) {
+					int status = 0;
+					demangled = abi::__cxa_demangle(ti->name(), nullptr, nullptr, &status);
+					if (status == 0 && demangled)
+						type_name = demangled;
+				}
+#endif
+				warnx("gdb command handling failed (cmd=%s, pkt=%s): unknown exception type=%s",
+				      cmd ? cmd->name : "<null>", (pkt && pkt->data) ? pkt->data : "<null>", type_name);
+#ifdef __GNUG__
+				free(demangled);
+#endif
+				send_packet(conn, "E03");
+			}
 
 		next2:
-			gdb_free_cmd(cmd);
+			if (cmd)
+				gdb_free_cmd(cmd);
 		next1:
 			gdb_free_packet(pkt);
 		} else {
